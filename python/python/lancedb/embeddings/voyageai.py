@@ -24,6 +24,7 @@ VOYAGE_TOTAL_TOKEN_LIMITS = {
     "voyage-4": 320_000,
     "voyage-4-lite": 1_000_000,
     "voyage-4-large": 120_000,
+    "voyage-context-4": 120_000,
     "voyage-context-3": 32_000,
     "voyage-3.5-lite": 1_000_000,
     "voyage-3.5": 320_000,
@@ -173,6 +174,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             * voyage-4 (1024 dims, general-purpose and multilingual retrieval)
             * voyage-4-lite (1024 dims, optimized for latency and cost)
             * voyage-4-large (1024 dims, best retrieval quality)
+            * voyage-context-4 (1024 dims, contextualized chunk embeddings)
             * voyage-context-3
             * voyage-3.5
             * voyage-3.5-lite
@@ -234,7 +236,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         "voyage-code-2",
     ]
     multimodal_embedding_models: list = ["voyage-multimodal-3", "voyage-multimodal-3.5"]
-    contextual_embedding_models: list = ["voyage-context-3"]
+    contextual_embedding_models: list = ["voyage-context-4", "voyage-context-3"]
 
     def _is_multimodal_model(self, model_name: str):
         return (
@@ -264,6 +266,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             "voyage-4",
             "voyage-4-lite",
             "voyage-4-large",
+            "voyage-context-4",
             "voyage-context-3",
             "voyage-3.5",
             "voyage-3.5-lite",
@@ -306,7 +309,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             )
         elif self._is_contextual_model(self.name):
             result = client.contextualized_embed(
-                inputs=[[query]], model=self.name, input_type="query", **kwargs
+                inputs=[query], model=self.name, input_type="query", **kwargs
             )
             result = result.results[0]
         else:
@@ -443,9 +446,14 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
 
             def embed_batch(batch: List[str]) -> List[np.array]:
                 result = client.contextualized_embed(
-                    inputs=[batch], model=self.name, input_type=input_type, **kwargs
+                    inputs=batch,
+                    model=self.name,
+                    input_type=input_type,
+                    enable_auto_chunking=True,
+                    chunk_size=32000,
+                    **kwargs,
                 )
-                return result.results[0].embeddings
+                return [r.embeddings[0] for r in result.results]
 
             return embed_batch
 
