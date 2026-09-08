@@ -19,16 +19,21 @@ from .utils import api_key_not_found_help, IMAGES, TEXT
 if TYPE_CHECKING:
     import PIL
 
-# Token limits for different VoyageAI models
+# Token limits for different VoyageAI (by MongoDB) models
 VOYAGE_TOTAL_TOKEN_LIMITS = {
     "voyage-4": 320_000,
     "voyage-4-lite": 1_000_000,
     "voyage-4-large": 120_000,
+    "voyage-4-nano": 1_000_000,
+    "voyage-code-4": 120_000,
+    "voyage-context-4": 32_000,
     "voyage-context-3": 32_000,
+    "voyage-3-large": 120_000,
     "voyage-3.5-lite": 1_000_000,
     "voyage-3.5": 320_000,
     "voyage-3-lite": 120_000,
     "voyage-3": 120_000,
+    "voyage-code-3": 120_000,
     "voyage-multimodal-3": 120_000,
     "voyage-finance-2": 120_000,
     "voyage-multilingual-2": 120_000,
@@ -158,26 +163,75 @@ def sanitize_text_input(inputs: TEXT) -> List[str]:
     return inputs
 
 
+def sanitize_contextual_input(
+    inputs: Union[TEXT, List[List[str]]],
+) -> List[List[str]]:
+    """
+    Normalize inputs for the ``contextualized_embed`` API to ``List[List[str]]``.
+
+    The official VoyageAI by MongoDB spec accepts ``inputs`` as
+    ``Union[List[List[str]], List[str]]``
+    (https://docs.voyageai.com/docs/contextualized-chunk-embeddings). Both
+    formats are supported here:
+
+    * A flat ``List[str]`` (or a single ``str``) is treated as the chunks of a
+      single document, so the model can share context across them, and is
+      wrapped into one inner list.
+    * A ``List[List[str]]`` is already grouped by document (one inner list per
+      document) and is passed through unchanged.
+    """
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    elif isinstance(inputs, pa.Array):
+        inputs = inputs.to_pylist()
+    elif isinstance(inputs, pa.ChunkedArray):
+        inputs = inputs.combine_chunks().to_pylist()
+
+    if not isinstance(inputs, list):
+        raise ValueError(
+            f"Input type {type(inputs)} not allowed with contextual model."
+        )
+
+    if all(isinstance(x, str) for x in inputs):
+        # Flat List[str]: chunks of one document.
+        return [inputs]
+
+    if all(
+        isinstance(x, list) and all(isinstance(chunk, str) for chunk in x)
+        for x in inputs
+    ):
+        # Already List[List[str]]: one inner list per document.
+        return inputs
+
+    raise ValueError("Contextual inputs must be List[str] or List[List[str]] of str.")
+
+
 @register("voyageai")
 class VoyageAIEmbeddingFunction(EmbeddingFunction):
     """
-    An embedding function that uses the VoyageAI API
+    An embedding function that uses the VoyageAI by MongoDB API
 
     https://docs.voyageai.com/docs/embeddings
 
     Parameters
     ----------
     name : str
-        The name of the model to use. List of acceptable models:
+        The name of the model to use. List of acceptable models (see
+        https://docs.voyageai.com/docs/embeddings for the current lineup):
 
+            * voyage-4-large (1024 dims, best retrieval quality)
             * voyage-4 (1024 dims, general-purpose and multilingual retrieval)
             * voyage-4-lite (1024 dims, optimized for latency and cost)
-            * voyage-4-large (1024 dims, best retrieval quality)
-            * voyage-context-3
+            * voyage-4-nano (1024 dims, open-weight)
+            * voyage-code-4 (1024 dims, code retrieval and coding agents)
+            * voyage-context-4 (contextualized chunk embeddings, latest)
+            * voyage-context-3 (contextualized chunk embeddings)
+            * voyage-3-large
             * voyage-3.5
             * voyage-3.5-lite
             * voyage-3
             * voyage-3-lite
+            * voyage-code-3
             * voyage-multimodal-3
             * voyage-multimodal-3.5
             * voyage-finance-2
@@ -221,20 +275,24 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
     _FLEXIBLE_DIM_MODELS: ClassVar[list] = ["voyage-multimodal-3.5"]
     _VALID_DIMENSIONS: ClassVar[list] = [256, 512, 1024, 2048]
     text_embedding_models: list = [
+        "voyage-4-large",
         "voyage-4",
         "voyage-4-lite",
-        "voyage-4-large",
+        "voyage-4-nano",
+        "voyage-code-4",
+        "voyage-3-large",
         "voyage-3.5",
         "voyage-3.5-lite",
         "voyage-3",
         "voyage-3-lite",
+        "voyage-code-3",
         "voyage-finance-2",
         "voyage-multilingual-2",
         "voyage-law-2",
         "voyage-code-2",
     ]
     multimodal_embedding_models: list = ["voyage-multimodal-3", "voyage-multimodal-3.5"]
-    contextual_embedding_models: list = ["voyage-context-3"]
+    contextual_embedding_models: list = ["voyage-context-4", "voyage-context-3"]
 
     def _is_multimodal_model(self, model_name: str):
         return (
@@ -264,10 +322,15 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             "voyage-4",
             "voyage-4-lite",
             "voyage-4-large",
+            "voyage-4-nano",
+            "voyage-code-4",
+            "voyage-context-4",
             "voyage-context-3",
+            "voyage-3-large",
             "voyage-3.5",
             "voyage-3.5-lite",
             "voyage-3",
+            "voyage-code-3",
             "voyage-multimodal-3",
             "voyage-finance-2",
             "voyage-multilingual-2",
@@ -282,6 +345,32 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         if self.name in self._FLEXIBLE_DIM_MODELS and self.output_dimension is not None:
             kwargs["output_dimension"] = self.output_dimension
         return kwargs
+
+    def _contextualized_embed(
+        self,
+        client,
+        inputs: Union[TEXT, List[List[str]]],
+        input_type: str,
+        **kwargs,
+    ) -> List[np.array]:
+        """
+        Call the ``contextualized_embed`` API and return a flat list of
+        embeddings.
+
+        ``inputs`` may be a flat ``List[str]`` or a nested ``List[List[str]]``
+        (both formats accepted by the official spec); it is normalized via
+        :func:`sanitize_contextual_input`. Embeddings from every document in the
+        response are concatenated in order, so the returned list matches the
+        flattened input chunks.
+        """
+        normalized = sanitize_contextual_input(inputs)
+        result = client.contextualized_embed(
+            inputs=normalized, model=self.name, input_type=input_type, **kwargs
+        )
+        embeddings: List[np.array] = []
+        for document_result in result.results:
+            embeddings.extend(document_result.embeddings)
+        return embeddings
 
     def compute_query_embeddings(
         self, query: Union[str, "PIL.Image.Image"], *args, **kwargs
@@ -305,10 +394,10 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
                 inputs=[[query]], model=self.name, input_type="query", **kwargs
             )
         elif self._is_contextual_model(self.name):
-            result = client.contextualized_embed(
-                inputs=[[query]], model=self.name, input_type="query", **kwargs
+            embeddings = self._contextualized_embed(
+                client, [query], input_type="query", **kwargs
             )
-            result = result.results[0]
+            return [embeddings[0]]
         else:
             result = client.embed(
                 texts=[query], model=self.name, input_type="query", **kwargs
@@ -442,10 +531,9 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         elif self._is_contextual_model(self.name):
 
             def embed_batch(batch: List[str]) -> List[np.array]:
-                result = client.contextualized_embed(
-                    inputs=[batch], model=self.name, input_type=input_type, **kwargs
+                return self._contextualized_embed(
+                    client, batch, input_type=input_type, **kwargs
                 )
-                return result.results[0].embeddings
 
             return embed_batch
 
