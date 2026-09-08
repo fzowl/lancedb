@@ -1,6 +1,6 @@
-# VoyageAI Embeddings : Multimodal
+# VoyageAI by MongoDB Embeddings : Multimodal
 
-VoyageAI embeddings can also be used to embed both text and image data, only some of the models support image data and you can check the list
+VoyageAI by MongoDB embeddings can also be used to embed both text and image data, only some of the models support image data and you can check the list
 under [https://docs.voyageai.com/docs/multimodal-embeddings](https://docs.voyageai.com/docs/multimodal-embeddings)
 
 Supported multimodal models:
@@ -20,7 +20,7 @@ Supported parameters (to be passed in `create` method) are:
 
 | Parameter | Type | Default Value           | Description                               |
 |---|---|-------------------------|-------------------------------------------|
-| `name` | `str` | `"voyage-multimodal-3"` | The model ID of the VoyageAI model to use |
+| `name` | `str` | `"voyage-multimodal-3"` | The model ID of the VoyageAI by MongoDB model to use |
 | `output_dimension` | `int` | `None` | Output dimension for voyage-multimodal-3.5. Valid: 256, 512, 1024, 2048 |
 
 Usage Example:
