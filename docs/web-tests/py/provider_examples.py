@@ -332,7 +332,7 @@ def reranking_voyageai_usage():
     ]
     tbl = db.create_table("test", schema=Schema)
     tbl.add(data)
-    reranker = VoyageAIReranker(api_key="your-api-key", model_name="rerank-2")
+    reranker = VoyageAIReranker(api_key="your-api-key", model_name="rerank-3")
 
     # Run vector search with a reranker
     vector_results = tbl.search("hello").rerank(reranker=reranker).to_list()
