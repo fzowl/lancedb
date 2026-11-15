@@ -61,6 +61,16 @@ CONTEXTUALIZED_CHUNK_SIZE = 32_000
 BATCH_SIZE = 1000
 
 
+class VoyageInputError(ValueError):
+    """An input or option that Voyage rejects, so retrying cannot help.
+
+    ``http_status`` makes the embedding retry logic treat it as a permanent
+    client error instead of re-sending the same request.
+    """
+
+    http_status = 400
+
+
 def is_valid_url(text):
     try:
         parsed = urlparse(text)
@@ -302,7 +312,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         if self.name in self._FLEXIBLE_DIM_MODELS:
             if self.output_dimension is not None:
                 if self.output_dimension not in self._VALID_DIMENSIONS:
-                    raise ValueError(
+                    raise VoyageInputError(
                         f"Invalid output_dimension {self.output_dimension} "
                         f"for {self.name}. Valid options: {self._VALID_DIMENSIONS}"
                     )
@@ -310,7 +320,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             return 1024  # default dimension
 
         if self.output_dimension is not None:
-            raise ValueError(
+            raise VoyageInputError(
                 f"output_dimension is not supported by {self.name}. "
                 f"Models that support it: {self._FLEXIBLE_DIM_MODELS}"
             )
@@ -516,11 +526,6 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             return embed_batch
 
         elif self._is_contextual_model(self.name):
-            if input_type != "document":
-                raise ValueError(
-                    "Batched contextualized embeddings only support "
-                    f"input_type='document', got {input_type!r}"
-                )
             # Each text is its own document: a flat list of strings, split into
             # chunks by the API. Auto-chunking is only valid for documents.
             kwargs["enable_auto_chunking"] = True
@@ -530,15 +535,10 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
                 result = client.contextualized_embed(
                     inputs=batch, model=self.name, input_type=input_type, **kwargs
                 )
-                if len(result.results) != len(batch):
-                    raise ValueError(
-                        f"Expected {len(batch)} contextualized results, "
-                        f"got {len(result.results)}"
-                    )
                 embeddings = []
                 for i, document in enumerate(result.results):
                     if len(document.embeddings) != 1:
-                        raise ValueError(
+                        raise VoyageInputError(
                             f"Input {i} was split into {len(document.embeddings)} "
                             "chunks, but exactly one embedding per input is "
                             "required. Shorten the input."

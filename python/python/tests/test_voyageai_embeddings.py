@@ -337,3 +337,17 @@ def test_every_supported_model_has_a_token_limit_entry():
         | set(func.contextual_embedding_models)
     )
     assert supported == set(VOYAGE_TOTAL_TOKEN_LIMITS)
+
+
+def test_input_errors_are_not_retried():
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.tokenize.return_value = [[1]]
+    client.contextualized_embed.return_value = _contextualized_result([2])
+    VoyageAIEmbeddingFunction.client = client
+    func = get_registry().get("voyageai").create(name="voyage-context-4")
+
+    with pytest.raises(ValueError, match="split into 2 chunks"):
+        func.compute_source_embeddings_with_retry(["long document"])
+    client.contextualized_embed.assert_called_once()
