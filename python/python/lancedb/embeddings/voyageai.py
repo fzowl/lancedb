@@ -2,7 +2,16 @@
 # SPDX-FileCopyrightText: Copyright The LanceDB Authors
 import base64
 import os
-from typing import ClassVar, TYPE_CHECKING, List, Union, Any, Generator, Optional
+from typing import (
+    ClassVar,
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Union,
+    Any,
+    Generator,
+    Optional,
+)
 
 from pathlib import Path
 from urllib.parse import urlparse
@@ -19,25 +28,47 @@ from .utils import api_key_not_found_help, IMAGES, TEXT
 if TYPE_CHECKING:
     import PIL
 
-# Token limits for different VoyageAI models
-VOYAGE_TOTAL_TOKEN_LIMITS = {
+# Per-request token limits for the Voyage AI by MongoDB models. A value of None
+# means Voyage documents no per-request token limit for the model, so requests
+# are only split by the number of inputs (BATCH_SIZE).
+VOYAGE_TOTAL_TOKEN_LIMITS: Dict[str, Optional[int]] = {
+    "voyage-4-large": 120_000,
     "voyage-4": 320_000,
     "voyage-4-lite": 1_000_000,
-    "voyage-4-large": 120_000,
-    "voyage-context-3": 32_000,
-    "voyage-3.5-lite": 1_000_000,
+    "voyage-code-4": None,
+    "voyage-context-4": 120_000,
+    "voyage-context-3": 120_000,
+    "voyage-3-large": 120_000,
     "voyage-3.5": 320_000,
+    "voyage-3.5-lite": 1_000_000,
+    "voyage-code-3": 120_000,
     "voyage-3-lite": 120_000,
     "voyage-3": 120_000,
     "voyage-multimodal-3": 120_000,
+    "voyage-multimodal-3.5": 120_000,
     "voyage-finance-2": 120_000,
     "voyage-multilingual-2": 120_000,
     "voyage-law-2": 120_000,
     "voyage-code-2": 120_000,
 }
 
+# Chunk size, in tokens, sent with contextualized document embeddings. It is the
+# largest value the API accepts, so a document within the model's context window
+# is embedded as a single chunk.
+CONTEXTUALIZED_CHUNK_SIZE = 32_000
+
 # Batch size for embedding requests (max number of items per batch)
 BATCH_SIZE = 1000
+
+
+class VoyageInputError(ValueError):
+    """An input or option that Voyage rejects, so retrying cannot help.
+
+    ``http_status`` makes the embedding retry logic treat it as a permanent
+    client error instead of re-sending the same request.
+    """
+
+    http_status = 400
 
 
 def is_valid_url(text):
@@ -163,21 +194,28 @@ def sanitize_text_input(inputs: TEXT) -> List[str]:
 @register("voyageai")
 class VoyageAIEmbeddingFunction(EmbeddingFunction):
     """
-    An embedding function that uses the VoyageAI API
+    An embedding function that uses the Voyage AI by MongoDB API
 
     https://docs.voyageai.com/docs/embeddings
+
+    Requires the ``voyageai`` package, version 0.4.0 or later, and the
+    ``VOYAGE_API_KEY`` environment variable.
 
     Parameters
     ----------
     name : str
         The name of the model to use. List of acceptable models:
 
+            * voyage-4-large (1024 dims, best retrieval quality)
             * voyage-4 (1024 dims, general-purpose and multilingual retrieval)
             * voyage-4-lite (1024 dims, optimized for latency and cost)
-            * voyage-4-large (1024 dims, best retrieval quality)
-            * voyage-context-3
+            * voyage-code-4 (1024 dims, code retrieval)
+            * voyage-context-4 (1024 dims, contextualized embeddings)
+            * voyage-context-3 (1024 dims, contextualized embeddings)
+            * voyage-3-large
             * voyage-3.5
             * voyage-3.5-lite
+            * voyage-code-3
             * voyage-3
             * voyage-3-lite
             * voyage-multimodal-3
@@ -188,9 +226,17 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             * voyage-code-2
 
     output_dimension : int, optional
-        The output dimension for models that support flexible dimensions.
-        Currently only voyage-multimodal-3.5 supports this feature.
-        Valid options: 256, 512, 1024 (default), 2048.
+        The output dimension for models that support flexible dimensions:
+        the voyage-4 family, voyage-code-4, voyage-context-4, voyage-context-3,
+        voyage-3-large, voyage-3.5, voyage-3.5-lite, voyage-code-3 and
+        voyage-multimodal-3.5. Valid options: 256, 512, 1024 (default), 2048.
+        Setting it for any other model raises a ``ValueError``.
+
+    Notes
+    -----
+    For the ``voyage-context-*`` models every source input is embedded as its
+    own document, and each document must produce a single embedding: an input
+    that the API splits into several chunks raises a ``ValueError``.
 
     Examples
     --------
@@ -220,14 +266,29 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
     name: str
     output_dimension: Optional[int] = None
     client: ClassVar = None
-    _FLEXIBLE_DIM_MODELS: ClassVar[list] = ["voyage-multimodal-3.5"]
+    _FLEXIBLE_DIM_MODELS: ClassVar[list] = [
+        "voyage-4-large",
+        "voyage-4",
+        "voyage-4-lite",
+        "voyage-code-4",
+        "voyage-context-4",
+        "voyage-context-3",
+        "voyage-3-large",
+        "voyage-3.5",
+        "voyage-3.5-lite",
+        "voyage-code-3",
+        "voyage-multimodal-3.5",
+    ]
     _VALID_DIMENSIONS: ClassVar[list] = [256, 512, 1024, 2048]
     text_embedding_models: list = [
         "voyage-4",
         "voyage-4-lite",
         "voyage-4-large",
+        "voyage-code-4",
+        "voyage-3-large",
         "voyage-3.5",
         "voyage-3.5-lite",
+        "voyage-code-3",
         "voyage-3",
         "voyage-3-lite",
         "voyage-finance-2",
@@ -236,7 +297,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         "voyage-code-2",
     ]
     multimodal_embedding_models: list = ["voyage-multimodal-3", "voyage-multimodal-3.5"]
-    contextual_embedding_models: list = ["voyage-context-3"]
+    contextual_embedding_models: list = ["voyage-context-4", "voyage-context-3"]
 
     def _is_multimodal_model(self, model_name: str):
         return (
@@ -251,12 +312,18 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         if self.name in self._FLEXIBLE_DIM_MODELS:
             if self.output_dimension is not None:
                 if self.output_dimension not in self._VALID_DIMENSIONS:
-                    raise ValueError(
+                    raise VoyageInputError(
                         f"Invalid output_dimension {self.output_dimension} "
                         f"for {self.name}. Valid options: {self._VALID_DIMENSIONS}"
                     )
                 return self.output_dimension
             return 1024  # default dimension
+
+        if self.output_dimension is not None:
+            raise VoyageInputError(
+                f"output_dimension is not supported by {self.name}. "
+                f"Models that support it: {self._FLEXIBLE_DIM_MODELS}"
+            )
 
         if self.name == "voyage-3-lite":
             return 512
@@ -266,9 +333,13 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             "voyage-4",
             "voyage-4-lite",
             "voyage-4-large",
+            "voyage-code-4",
+            "voyage-context-4",
             "voyage-context-3",
+            "voyage-3-large",
             "voyage-3.5",
             "voyage-3.5-lite",
+            "voyage-code-3",
             "voyage-3",
             "voyage-multimodal-3",
             "voyage-finance-2",
@@ -279,9 +350,11 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         else:
             raise ValueError(f"Model {self.name} not supported")
 
-    def _get_multimodal_kwargs(self, **kwargs):
-        """Get kwargs for multimodal embed call, including output_dimension if set."""
-        if self.name in self._FLEXIBLE_DIM_MODELS and self.output_dimension is not None:
+    def _get_dimension_kwargs(self, **kwargs):
+        """Get kwargs for an embed call, including output_dimension only if set."""
+        if self.output_dimension is not None:
+            # Validates the model and the requested dimension.
+            self.ndims()
             kwargs["output_dimension"] = self.output_dimension
         return kwargs
 
@@ -301,12 +374,13 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             List[np.array]: the list of embeddings
         """
         client = VoyageAIEmbeddingFunction._get_client()
+        kwargs = self._get_dimension_kwargs(**kwargs)
         if self._is_multimodal_model(self.name):
-            kwargs = self._get_multimodal_kwargs(**kwargs)
             result = client.multimodal_embed(
                 inputs=[[query]], model=self.name, input_type="query", **kwargs
             )
         elif self._is_contextual_model(self.name):
+            # Auto-chunking is only valid for documents, never for queries.
             result = client.contextualized_embed(
                 inputs=[[query]], model=self.name, input_type="query", **kwargs
             )
@@ -344,7 +418,7 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             )
             if has_images:
                 # Use non-batched API for images
-                kwargs = self._get_multimodal_kwargs(**kwargs)
+                kwargs = self._get_dimension_kwargs(**kwargs)
                 result = client.multimodal_embed(
                     inputs=sanitized, model=self.name, input_type="document", **kwargs
                 )
@@ -379,13 +453,19 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         if not texts:
             return
 
-        max_tokens_per_batch = VOYAGE_TOTAL_TOKEN_LIMITS.get(self.name, 120_000)
+        if self.name not in VOYAGE_TOTAL_TOKEN_LIMITS:
+            raise ValueError(f"Model {self.name} not supported")
+        max_tokens_per_batch = VOYAGE_TOTAL_TOKEN_LIMITS[self.name]
         current_batch: List[str] = []
         current_batch_tokens = 0
 
-        # Tokenize all texts in one API call
-        token_lists = client.tokenize(texts, model=self.name)
-        token_counts = [len(token_list) for token_list in token_lists]
+        if max_tokens_per_batch is None:
+            # No documented token limit: only the number of inputs is limited.
+            token_counts = [0] * len(texts)
+        else:
+            # Count the tokens of all texts with the SDK tokenizer
+            token_lists = client.tokenize(texts, model=self.name)
+            token_counts = [len(token_list) for token_list in token_lists]
 
         for i, text in enumerate(texts):
             n_tokens = token_counts[i]
@@ -393,7 +473,10 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
             # Check if adding this text would exceed limits
             if current_batch and (
                 len(current_batch) >= BATCH_SIZE
-                or (current_batch_tokens + n_tokens > max_tokens_per_batch)
+                or (
+                    max_tokens_per_batch is not None
+                    and current_batch_tokens + n_tokens > max_tokens_per_batch
+                )
             ):
                 # Yield the current batch and start a new one
                 yield current_batch
@@ -426,8 +509,9 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
         -------
             callable: A function that takes a batch of texts and returns embeddings.
         """
+        kwargs = self._get_dimension_kwargs(**kwargs)
+
         if self._is_multimodal_model(self.name):
-            multimodal_kwargs = self._get_multimodal_kwargs(**kwargs)
 
             def embed_batch(batch: List[str]) -> List[np.array]:
                 batch_inputs = sanitize_multimodal_input(batch)
@@ -435,19 +519,32 @@ class VoyageAIEmbeddingFunction(EmbeddingFunction):
                     inputs=batch_inputs,
                     model=self.name,
                     input_type=input_type,
-                    **multimodal_kwargs,
+                    **kwargs,
                 )
                 return result.embeddings
 
             return embed_batch
 
         elif self._is_contextual_model(self.name):
+            # Each text is its own document: a flat list of strings, split into
+            # chunks by the API. Auto-chunking is only valid for documents.
+            kwargs["enable_auto_chunking"] = True
+            kwargs["chunk_size"] = CONTEXTUALIZED_CHUNK_SIZE
 
             def embed_batch(batch: List[str]) -> List[np.array]:
                 result = client.contextualized_embed(
-                    inputs=[batch], model=self.name, input_type=input_type, **kwargs
+                    inputs=batch, model=self.name, input_type=input_type, **kwargs
                 )
-                return result.results[0].embeddings
+                embeddings = []
+                for i, document in enumerate(result.results):
+                    if len(document.embeddings) != 1:
+                        raise VoyageInputError(
+                            f"Input {i} was split into {len(document.embeddings)} "
+                            "chunks, but exactly one embedding per input is "
+                            "required. Shorten the input."
+                        )
+                    embeddings.append(document.embeddings[0])
+                return embeddings
 
             return embed_batch
 

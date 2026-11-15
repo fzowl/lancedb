@@ -625,11 +625,36 @@ def test_jina_reranker(tmp_path):
 @pytest.mark.skipif(
     os.environ.get("VOYAGE_API_KEY") is None, reason="VOYAGE_API_KEY not set"
 )
-def test_voyageai_reranker(tmp_path):
+@pytest.mark.parametrize("model_name", ["rerank-3", "rerank-3-lite", "rerank-2.5"])
+def test_voyageai_reranker(tmp_path, model_name):
     pytest.importorskip("voyageai")
-    reranker = VoyageAIReranker(model_name="rerank-2.5")
+    reranker = VoyageAIReranker(model_name=model_name)
     table, schema = get_test_table(tmp_path)
-    _run_test_reranker(reranker, table, "single player experience", None, schema)
+    _run_test_reranker(
+        reranker,
+        table,
+        "single player experience",
+        None,
+        schema,
+        deterministic=False,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("VOYAGE_API_KEY") is None, reason="VOYAGE_API_KEY not set"
+)
+def test_voyageai_reranker_top_n():
+    pytest.importorskip("voyageai")
+    reranker = VoyageAIReranker(model_name="rerank-3", top_n=2)
+    results = pa.table(
+        {
+            "text": ["alpha is a greek letter", "bananas are yellow", "greek alphabet"],
+            "_distance": [0.1, 0.2, 0.3],
+        }
+    )
+    reranked = reranker.rerank_vector("greek letters", results)
+    assert len(reranked) == 2
+    assert "_relevance_score" in reranked.column_names
 
 
 class _FakeTypeSafeClient:

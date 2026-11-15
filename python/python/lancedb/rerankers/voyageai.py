@@ -14,13 +14,15 @@ from .base import Reranker
 
 class VoyageAIReranker(Reranker):
     """
-    Reranks the results using the VoyageAI Rerank API.
+    Reranks the results using the Voyage AI by MongoDB Rerank API.
     https://docs.voyageai.com/docs/reranker
 
     Parameters
     ----------
-    model_name : str, default "rerank-english-v2.0"
-        The name of the cross encoder model to use. Available voyageai models are:
+    model_name : str
+        The name of the reranker model to use. Available Voyage AI models are:
+        - rerank-3
+        - rerank-3-lite
         - rerank-2.5
         - rerank-2.5-lite
         - rerank-2

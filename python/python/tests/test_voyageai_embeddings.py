@@ -50,7 +50,15 @@ class TestVoyageAIModelRegistration:
             ("voyage-4", 1024),
             ("voyage-4-lite", 1024),
             ("voyage-4-large", 1024),
+            ("voyage-code-4", 1024),
+            # Contextualized
+            ("voyage-context-4", 1024),
+            ("voyage-context-3", 1024),
             # Voyage-3 series
+            ("voyage-3-large", 1024),
+            ("voyage-3.5", 1024),
+            ("voyage-3.5-lite", 1024),
+            ("voyage-code-3", 1024),
             ("voyage-3", 1024),
             ("voyage-3-lite", 512),
             # Domain-specific models
@@ -179,3 +187,167 @@ def test_text_source_embeddings_reject_non_text_batch_entries(inputs):
         func.compute_source_embeddings(inputs)
     client.tokenize.assert_not_called()
     client.embed.assert_not_called()
+
+
+@pytest.mark.parametrize("model_name", ["voyage-code-4", "voyage-context-4"])
+def test_output_dimension_is_sent_only_when_requested(model_name):
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.tokenize.return_value = [[1]]
+    client.embed.return_value.embeddings = [[0.1] * 256]
+    client.contextualized_embed.return_value.results = [MagicMock(embeddings=[[0.1]])]
+    VoyageAIEmbeddingFunction.client = client
+
+    func = get_registry().get("voyageai").create(name=model_name)
+    func.compute_source_embeddings(["text"])
+    for call in (client.embed.call_args, client.contextualized_embed.call_args):
+        if call is not None:
+            assert "output_dimension" not in call.kwargs
+
+    func = get_registry().get("voyageai").create(name=model_name, output_dimension=256)
+    assert func.ndims() == 256
+    func.compute_source_embeddings(["text"])
+    call = client.embed.call_args or client.contextualized_embed.call_args
+    assert call.kwargs["output_dimension"] == 256
+
+
+@pytest.mark.parametrize(
+    "model_name,output_dimension",
+    [("voyage-3", 256), ("voyage-code-4", 128)],
+    ids=["model-without-flexible-dimensions", "invalid-dimension"],
+)
+def test_invalid_output_dimension_raises(model_name, output_dimension):
+    func = (
+        get_registry()
+        .get("voyageai")
+        .create(name=model_name, output_dimension=output_dimension)
+    )
+    with pytest.raises(ValueError, match="output_dimension"):
+        func.ndims()
+
+
+def _contextualized_result(chunks_per_document):
+    result = MagicMock()
+    result.results = [
+        MagicMock(embeddings=[[float(i)] * 2 for _ in range(n)])
+        for i, n in enumerate(chunks_per_document)
+    ]
+    return result
+
+
+def test_contextualized_documents_use_flat_inputs_with_auto_chunking():
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.tokenize.return_value = [[1], [2]]
+    client.contextualized_embed.return_value = _contextualized_result([1, 1])
+    VoyageAIEmbeddingFunction.client = client
+    func = get_registry().get("voyageai").create(name="voyage-context-4")
+
+    assert func.compute_source_embeddings(["first", "second"]) == [
+        [0.0, 0.0],
+        [1.0, 1.0],
+    ]
+    client.contextualized_embed.assert_called_once_with(
+        inputs=["first", "second"],
+        model="voyage-context-4",
+        input_type="document",
+        enable_auto_chunking=True,
+        chunk_size=32_000,
+    )
+
+
+def test_contextualized_query_does_not_use_auto_chunking():
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.contextualized_embed.return_value = _contextualized_result([1])
+    VoyageAIEmbeddingFunction.client = client
+    func = get_registry().get("voyageai").create(name="voyage-context-4")
+
+    func.compute_query_embeddings("question")
+    client.contextualized_embed.assert_called_once_with(
+        inputs=[["question"]], model="voyage-context-4", input_type="query"
+    )
+
+
+def test_contextualized_document_split_into_chunks_raises():
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.tokenize.return_value = [[1], [2]]
+    client.contextualized_embed.return_value = _contextualized_result([1, 2])
+    VoyageAIEmbeddingFunction.client = client
+    func = get_registry().get("voyageai").create(name="voyage-context-3")
+
+    with pytest.raises(ValueError, match="Input 1 was split into 2 chunks"):
+        func.compute_source_embeddings(["first", "second"])
+
+
+def _batches(model_name, token_counts):
+
+    client = MagicMock()
+    client.tokenize.side_effect = lambda texts, model: [[0] * n for n in token_counts]
+    func = get_registry().get("voyageai").create(name=model_name)
+    texts = [str(i) for i in range(len(token_counts))]
+    return client, texts, list(func._build_batches(client, texts))
+
+
+def test_batches_split_at_the_model_token_limit_and_keep_order():
+    # voyage-3 allows 120K tokens per request
+    client, texts, batches = _batches("voyage-3", [60_000, 60_000, 1, 119_999, 1])
+    assert batches == [["0", "1"], ["2", "3"], ["4"]]
+    assert [t for batch in batches for t in batch] == texts
+    client.tokenize.assert_called_once_with(texts, model="voyage-3")
+
+
+def test_batches_use_the_limit_of_each_model():
+    assert len(_batches("voyage-4", [200_000, 100_000])[2]) == 1  # 320K
+    assert len(_batches("voyage-4", [200_000, 130_000])[2]) == 2
+    assert len(_batches("voyage-4-lite", [600_000, 400_000])[2]) == 1  # 1M
+    assert len(_batches("voyage-3-large", [100_000, 30_000])[2]) == 2  # 120K
+
+
+def test_batches_are_limited_to_1000_inputs():
+    _, _, batches = _batches("voyage-4-lite", [1] * 2001)
+    assert [len(batch) for batch in batches] == [1000, 1000, 1]
+
+
+def test_batches_without_a_documented_token_limit_only_split_by_input_count():
+    client, _, batches = _batches("voyage-code-4", [1_000_000] * 1001)
+    assert [len(batch) for batch in batches] == [1000, 1]
+    client.tokenize.assert_not_called()
+
+
+def test_batches_reject_a_model_without_a_token_limit_entry():
+
+    func = get_registry().get("voyageai").create(name="unsupported-model")
+    with pytest.raises(ValueError, match="not supported"):
+        list(func._build_batches(MagicMock(), ["text"]))
+
+
+def test_every_supported_model_has_a_token_limit_entry():
+    from lancedb.embeddings.voyageai import VOYAGE_TOTAL_TOKEN_LIMITS
+
+    func = get_registry().get("voyageai").create(name="voyage-3")
+    supported = (
+        set(func.text_embedding_models)
+        | set(func.multimodal_embedding_models)
+        | set(func.contextual_embedding_models)
+    )
+    assert supported == set(VOYAGE_TOTAL_TOKEN_LIMITS)
+
+
+def test_input_errors_are_not_retried():
+    from lancedb.embeddings.voyageai import VoyageAIEmbeddingFunction
+
+    client = MagicMock()
+    client.tokenize.return_value = [[1]]
+    client.contextualized_embed.return_value = _contextualized_result([2])
+    VoyageAIEmbeddingFunction.client = client
+    func = get_registry().get("voyageai").create(name="voyage-context-4")
+
+    with pytest.raises(ValueError, match="split into 2 chunks"):
+        func.compute_source_embeddings_with_retry(["long document"])
+    client.contextualized_embed.assert_called_once()

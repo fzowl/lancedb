@@ -709,13 +709,13 @@ def test_embedding_voyageai_multimodal() -> None:
     tbl.add(
         [
             {
-                "image_uri": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/300px-PNG_transparency_demonstration_1.png"
+                "image_uri": "https://raw.githubusercontent.com/lancedb/lancedb/main/docs/src/assets/dog_clip_output.png"
             },
         ]
     )
 
     # Search with text query
-    results = tbl.search("dice").limit(1).to_list()
+    results = tbl.search("dog").limit(1).to_list()
     print(results)
     # --8<-- [end:embedding_voyageai_multimodal]
 
@@ -1108,7 +1108,7 @@ def test_reranking_voyageai_usage() -> None:
     ]
     tbl = db.create_table("test", schema=Schema, mode="overwrite")
     tbl.add(data)
-    reranker = VoyageAIReranker(model_name="rerank-2")
+    reranker = VoyageAIReranker(model_name="rerank-3")
 
     # Run vector search with a reranker
     result = tbl.search("hello").rerank(reranker=reranker).to_list()
